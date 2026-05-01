@@ -1,0 +1,9 @@
+experiment: exp002_fsar_unified
+seed: 42
+episodes: 1000
+way: 4
+shot: 5
+query: 5
+classes: [feeding, head_swing, inactive, locomotion]
+labels_csv: data/splits/silkbehav4_valid1153.csv
+episode_output: experiments/exp002_fsar_unified/episodes_4w5s5q_seed42.jsonl
