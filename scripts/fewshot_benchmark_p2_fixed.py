@@ -17,6 +17,7 @@ Created: 2026-05-01
 """
 
 import os, sys, json, math, random, argparse, copy
+from functools import lru_cache
 from pathlib import Path
 from collections import defaultdict
 
@@ -37,13 +38,14 @@ SPLIT_FILE  = Path("/home/fmh/SilkVIM/outputs/diagnostics/exp023_team_silkvim_sp
 TEAM_REPO   = Path("/home/fmh/SilkVIM/refs/selector_refs/TEAM_official")
 CKPT_REL    = Path("pretrained/hmdb/TEAM/ResNet/1-shot/an60/checkpoint_best_val.pt")
 CKPT_PATH   = TEAM_REPO / CKPT_REL
+VIDEOMAE_MODEL_DIR = Path("models/videomae_baseline_run1/best_model")
 
 # Ref: TEAM official – configs/*.yaml
 CLASSES     = ["feeding", "head_swing", "inactive", "locomotion"]
 N_WAY       = 4
 QUERY_PER_CLASS = 15          # standard few-shot query budget
 NUM_EPISODES    = 600
-NUM_FRAMES      = 8           # Ref: TEAM default –cfg num_input_frames=8
+NUM_FRAMES      = 16          # VideoMAE default temporal length
 SEED            = 42
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -315,7 +317,10 @@ def load_split(split_file: Path, frame_dir: Path, allow_scan_fallback: bool = Tr
     return samples
 
 
-def read_video_frames(video_dir: Path, num_frames: int = NUM_FRAMES):
+@lru_cache(maxsize=4096)
+def _read_video_frames_cached(video_dir_str: str, num_frames: int = NUM_FRAMES):
+    video_dir = Path(video_dir_str)
+
     """
     Uniform temporal sampling of frames from a directory.
     Ref: TEAM official – dataset/video_reader.py (uniform segment sampling)
@@ -336,6 +341,14 @@ def read_video_frames(video_dir: Path, num_frames: int = NUM_FRAMES):
         img = Image.open(jpgs[idx]).convert("RGB")
         frames.append(TRANSFORM(img))
     return torch.stack(frames)  # [T, 3, 224, 224]
+
+
+def read_video_frames(video_dir: Path, num_frames: int = NUM_FRAMES):
+    """
+    Thin wrapper over cached frame decoding to avoid repeatedly loading
+    the same JPGs across episodes/methods.
+    """
+    return _read_video_frames_cached(str(video_dir), num_frames).clone()
 
 
 # ────────────────────────────────────────────────────────────────
@@ -379,7 +392,7 @@ class EpisodeSampler:
 
         for _ in range(self.num_episodes):
             # For 4-way with exactly 4 classes: use all classes, shuffle order
-            chosen = list(class_ids)
+            chosen = self.rng.sample(class_ids, self.n_way)
             self.rng.shuffle(chosen)
 
             support_paths, support_labels = [], []
@@ -389,14 +402,20 @@ class EpisodeSampler:
                 pool = list(self.class_samples[cls_id])
                 self.rng.shuffle(pool)
                 need = self.k_shots + self.query_per_class
-                if len(pool) < need:
-                    # Sample with replacement if insufficient
-                    selected = self.rng.choices(pool, k=need)
-                else:
+                if len(pool) >= need:
                     selected = pool[:need]
+                    s_paths = selected[:self.k_shots]
+                    q_paths = selected[self.k_shots:need]
+                else:
+                    # Keep support/query disjoint when possible, then pad query with replacement only.
+                    s_paths = pool[:min(self.k_shots, len(pool))]
+                    remaining = [p for p in pool if p not in set(s_paths)]
+                    q_paths = remaining[:self.query_per_class]
 
-                s_paths = selected[:self.k_shots]
-                q_paths = selected[self.k_shots:need]
+                    if len(s_paths) < self.k_shots:
+                        s_paths += self.rng.choices(pool, k=self.k_shots - len(s_paths))
+                    if len(q_paths) < self.query_per_class:
+                        q_paths += self.rng.choices(pool, k=self.query_per_class - len(q_paths))
 
                 support_paths.extend(s_paths)
                 support_labels.extend([new_label] * self.k_shots)
@@ -440,6 +459,46 @@ def build_resnet50_backbone():
     # Ref: TEAM model.py – self.backbone = nn.Sequential(*list(resnet.children())[:-1])
     backbone = nn.Sequential(*list(resnet.children())[:-1])  # output: [B, 2048, 1, 1]
     return backbone
+
+
+class VideoMAEEncoder(nn.Module):
+    """
+    VideoMAE encoder wrapper.
+    Input : [B, T, 3, 224, 224]
+    Output: [B, D]
+    """
+    def __init__(self, model_dir: str, pool: str = "cls"):
+        super().__init__()
+        self.model_dir = str(model_dir)
+        self.pool = pool
+        self.model = None
+        self.feat_dim = 768  # fallback for ViT-Base
+        self._build()
+
+    def _build(self):
+        try:
+            from transformers import VideoMAEModel
+        except Exception as e:
+            raise RuntimeError(
+                "transformers not available; cannot build VideoMAE encoder."
+            ) from e
+
+        model_dir = Path(self.model_dir)
+        if not model_dir.exists():
+            raise FileNotFoundError(f"VideoMAE model dir not found: {model_dir}")
+
+        self.model = VideoMAEModel.from_pretrained(str(model_dir), local_files_only=True)
+        self.model.eval()
+        if hasattr(self.model.config, "hidden_size"):
+            self.feat_dim = int(self.model.config.hidden_size)
+
+    def forward(self, x):
+        # x: [B, T, 3, H, W] -> pixel_values: [B, T, C, H, W]
+        outputs = self.model(pixel_values=x)
+        last_hidden = outputs.last_hidden_state  # [B, N, D]
+        if self.pool == "mean":
+            return last_hidden.mean(dim=1)
+        return last_hidden[:, 0]  # CLS token
 
 
 class TemporalPooler(nn.Module):
@@ -638,7 +697,7 @@ def resolve_checkpoint_path(ckpt_path: str, team_repo: str = str(TEAM_REPO)) -> 
     return str(raw)
 
 
-def load_team_checkpoint(model: TEAM_FSL, ckpt_path: str):
+def load_team_checkpoint(model: TEAM_FSL, ckpt_path: str, verbose: bool = True):
     """
     Load TEAM pretrained checkpoint (backbone + DPM, no classification head).
     Ref: TEAM official – run.py, state_dict key mapping.
@@ -701,8 +760,34 @@ def load_team_checkpoint(model: TEAM_FSL, ckpt_path: str):
             skipped += 1
 
     model.load_state_dict(model_state)
-    print(f"[CKPT] Loaded {loaded} params, skipped {skipped} "
-          f"(from {ckpt_path})")
+    if verbose:
+        print(f"[CKPT] Loaded {loaded} params, skipped {skipped} "
+              f"(from {ckpt_path})")
+
+    if skipped > 0:
+        missing = []
+        for k, v in new_state.items():
+            if k not in model_state:
+                missing.append((k, "missing"))
+            elif model_state[k].shape != v.shape:
+                missing.append((k, f"shape {tuple(v.shape)} -> {tuple(model_state[k].shape)}"))
+        if missing:
+            print("[CKPT] First skipped keys:")
+            for name, reason in missing[:12]:
+                print(f"  - {name}: {reason}")
+
+
+def build_encoder(backbone_name: str, videomae_model_dir: str, videomae_pool: str):
+    if backbone_name == "resnet50":
+        backbone = build_resnet50_backbone()
+        encoder = TemporalPooler(backbone)
+        feat_dim = 2048
+    elif backbone_name == "videomae":
+        encoder = VideoMAEEncoder(videomae_model_dir, pool=videomae_pool)
+        feat_dim = encoder.feat_dim
+    else:
+        raise ValueError(f"Unsupported backbone: {backbone_name}")
+    return encoder, feat_dim
 
 
 # ────────────────────────────────────────────────────────────────
@@ -776,6 +861,39 @@ def evaluate_method(model, sampler, n_way, k_shot, device):
     return accs, f1s
 
 
+
+def diagnose_sampler(sampler, max_episodes=50):
+    """
+    Diagnose support/query overlap and class usage in generated episodes.
+    """
+    n = min(len(sampler), max_episodes)
+    overlaps, duplicate_support, duplicate_query = 0, 0, 0
+
+    for i in range(n):
+        ep = sampler.episodes[i]
+        s = ep["support_paths"]
+        q = ep["query_paths"]
+        s_set = set(map(str, s))
+        q_set = set(map(str, q))
+
+        if len(s_set.intersection(q_set)) > 0:
+            overlaps += 1
+        if len(s_set) < len(s):
+            duplicate_support += 1
+        if len(q_set) < len(q):
+            duplicate_query += 1
+
+    print("[DIAG] Episode diagnostics")
+    print(f"[DIAG] checked episodes        : {n}")
+    print(f"[DIAG] support-query overlap  : {overlaps}/{n}")
+    print(f"[DIAG] support duplicates     : {duplicate_support}/{n}")
+    print(f"[DIAG] query duplicates       : {duplicate_query}/{n}")
+
+    print("[DIAG] class pool sizes:")
+    for cls_id in sorted(sampler.class_samples.keys()):
+        print(f"  {CLASSES[cls_id]}: {len(sampler.class_samples[cls_id])}")
+
+
 # ────────────────────────────────────────────────────────────────
 # 9. Main
 # ────────────────────────────────────────────────────────────────
@@ -797,6 +915,14 @@ def main():
     parser.add_argument("--shots", type=str, default="1,5",
                         help="Comma-separated k-shot values (default: 1,5)")
     parser.add_argument("--output_dir", type=str, default="results/p2_fewshot")
+    parser.add_argument("--diagnose_episodes", action="store_true",
+                        help="Print overlap and class-pool diagnostics for sampled episodes")
+    parser.add_argument("--diagnose_max_episodes", type=int, default=50,
+                        help="Max number of episodes used for diagnostics")
+    parser.add_argument("--backbone", type=str, default="both",
+                        choices=["resnet50", "videomae", "both"])
+    parser.add_argument("--videomae_model_dir", type=str, default=str(VIDEOMAE_MODEL_DIR))
+    parser.add_argument("--videomae_pool", type=str, default="cls", choices=["cls", "mean"])
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -841,37 +967,9 @@ def main():
         print(f"  {c}: {n} videos")
     print()
 
-    # ── Build shared backbone ──
-    # Ref: TEAM official – model.py, CNN_FSHead
-    backbone = build_resnet50_backbone()
-    encoder = TemporalPooler(backbone)
-
-    # ── Build models ──
-    # ProtoNet: same backbone, prototype matching head
-    # Ref: Snell et al. NeurIPS 2017
-    protonet = ProtoNet(encoder)
-
-    # TEAM: same backbone, DPM matching head
-    # Ref: TEAM CVPR 2025
-    # Deep-copy encoder so checkpoint loading doesn't cross-contaminate
-    encoder_team = copy.deepcopy(encoder)
-    team_model = TEAM_FSL(encoder_team)
-
-    # ── Load TEAM checkpoint ──
-    # Ref: TEAM official – run.py
-    load_team_checkpoint(team_model, args.ckpt)
-
-    # For ProtoNet: use the TEAM backbone weights (same backbone, fair comparison)
-    # Ref: experimental design – backbone consistency for ablation
-    protonet.encoder.backbone.load_state_dict(
-        team_model.encoder.backbone.state_dict()
-    )
-
-    protonet = protonet.to(DEVICE)
-    team_model = team_model.to(DEVICE)
-
     # ── Results collector ──
     all_results = {}
+    backbone_list = ["resnet50", "videomae"] if args.backbone == "both" else [args.backbone]
 
     for k_shot in shots:
         print(f"\n{'─' * 70}")
@@ -884,34 +982,54 @@ def main():
             samples, N_WAY, k_shot, args.query_per_class,
             args.episodes, args.seed, num_frames=args.num_frames
         )
+        if args.diagnose_episodes:
+            diagnose_sampler(sampler, max_episodes=args.diagnose_max_episodes)
 
-        methods = {
-            "ProtoNet": protonet,
-            "TEAM":     team_model,
-        }
+        for backbone_name in backbone_list:
+            print(f"\n▶ Building models for backbone={backbone_name} ...")
+            encoder, feat_dim = build_encoder(
+                backbone_name,
+                videomae_model_dir=args.videomae_model_dir,
+                videomae_pool=args.videomae_pool,
+            )
+            protonet = ProtoNet(encoder)
+            team_model = TEAM_FSL(copy.deepcopy(encoder), feat_dim=feat_dim)
 
-        for name, model in methods.items():
-            print(f"\n▶ Evaluating {name} ...")
-            accs, f1s = evaluate_method(model, sampler, N_WAY, k_shot, DEVICE)
+            if backbone_name == "resnet50":
+                load_team_checkpoint(team_model, args.ckpt)
+                protonet.encoder.backbone.load_state_dict(
+                    team_model.encoder.backbone.state_dict()
+                )
+            else:
+                print("[INFO] VideoMAE backbone: DPM is random init; no TEAM DPM checkpoint mapping.")
 
-            acc_mean, acc_ci = confidence_interval_95(accs)
-            f1_mean, f1_ci  = confidence_interval_95(f1s)
+            protonet = protonet.to(DEVICE)
+            team_model = team_model.to(DEVICE)
 
-            key = f"{N_WAY}way_{k_shot}shot_{name}"
-            all_results[key] = {
-                "method":   name,
-                "n_way":    N_WAY,
-                "k_shot":   k_shot,
-                "episodes": args.episodes,
-                "accuracy_mean": round(acc_mean, 4),
-                "accuracy_ci95": round(acc_ci, 4),
-                "macro_f1_mean": round(f1_mean, 4),
-                "macro_f1_ci95": round(f1_ci, 4),
+            methods = {
+                "ProtoNet": protonet,
+                "TEAM":     team_model,
             }
-
-            print(f"  ✓ {name:10s} | "
-                  f"Acc: {acc_mean:.4f} ± {acc_ci:.4f} | "
-                  f"F1:  {f1_mean:.4f} ± {f1_ci:.4f}")
+            for name, model in methods.items():
+                print(f"\n▶ Evaluating {name} [{backbone_name}] ...")
+                accs, f1s = evaluate_method(model, sampler, N_WAY, k_shot, DEVICE)
+                acc_mean, acc_ci = confidence_interval_95(accs)
+                f1_mean, f1_ci  = confidence_interval_95(f1s)
+                key = f"{backbone_name}_{N_WAY}way_{k_shot}shot_{name}"
+                all_results[key] = {
+                    "backbone": backbone_name,
+                    "method":   name,
+                    "n_way":    N_WAY,
+                    "k_shot":   k_shot,
+                    "episodes": args.episodes,
+                    "accuracy_mean": round(acc_mean, 4),
+                    "accuracy_ci95": round(acc_ci, 4),
+                    "macro_f1_mean": round(f1_mean, 4),
+                    "macro_f1_ci95": round(f1_ci, 4),
+                }
+                print(f"  ✓ {name:10s} [{backbone_name}] | "
+                      f"Acc: {acc_mean:.4f} ± {acc_ci:.4f} | "
+                      f"F1:  {f1_mean:.4f} ± {f1_ci:.4f}")
 
     # ── Summary Table ──
     print(f"\n\n{'=' * 70}")
@@ -926,6 +1044,8 @@ def main():
 
     for key, res in all_results.items():
         setting = f"{res['n_way']}w-{res['k_shot']}s"
+        if "backbone" in res:
+            setting = f"{res['backbone']}/{setting}"
         acc_str = f"{res['accuracy_mean']:.4f} ± {res['accuracy_ci95']:.4f}"
         f1_str  = f"{res['macro_f1_mean']:.4f} ± {res['macro_f1_ci95']:.4f}"
         print(f"{res['method']:<12} {setting:<12} {acc_str:<20} {f1_str:<20}")
